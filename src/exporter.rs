@@ -1,10 +1,13 @@
 use crate::softether_reader::SoftEtherReader;
 use anyhow::Error;
+use std::collections::HashSet;
+use std::sync::Mutex;
 use hyper::header::ContentType;
 use hyper::mime::{Mime, SubLevel, TopLevel};
 use hyper::server::{Request, Response, Server};
 use hyper::uri::RequestUri;
 use lazy_static::lazy_static;
+use std::time::Instant;
 use prometheus;
 use prometheus::{register_gauge_vec, Encoder, GaugeVec, TextEncoder};
 use serde::Deserialize;
@@ -117,6 +120,16 @@ lazy_static! {
         &["hub", "user"]
     )
     .unwrap();
+
+    static ref USER_DURATION_SECONDS: GaugeVec = register_gauge_vec!(
+        "softether_user_duration_seconds",
+        "Duration in seconds since the first session appearance.",    
+        &["hub", "user", "source_ip" ]
+    )
+    .unwrap();
+    static ref LABEL_COMBINATIONS: Mutex<HashSet<Vec<String>>> = Mutex::new(HashSet::<Vec<String>>::new());
+    static ref USER_SESSION_TIMESTAMPS: Mutex<HashMap<Vec<String>, Instant>> = Mutex::new(HashMap::new());
+
 }
 
 static LANDING_PAGE: &'static str = "<html>
@@ -196,6 +209,8 @@ impl Exporter {
                             }
                         };
 
+                    let mut current_session_keys: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
+
                     UP.with_label_values(&[&status.name]).set(1.0);
                     ONLINE
                         .with_label_values(&[&status.name])
@@ -245,10 +260,58 @@ impl Exporter {
 
                     let mut transfer_bytes = HashMap::new();
                     let mut transfer_packets = HashMap::new();
+
+
+                    {
+                        let set = LABEL_COMBINATIONS.lock().unwrap();
+                        for labels in set.iter() {
+                            let label_values: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+
+                            match USER_TRANSFER_BYTES.get_metric_with_label_values(&label_values) {
+                                Ok(metric) => {
+                                    metric.set(0.0);
+                                }
+                                Err(e) => {
+                                    eprintln!("Fehler beim Abrufen der Metrik für Labels {:?}: {:?}", label_values, e);
+                                }
+                            }
+                        }
+                    }
                     for session in sessions {
+
+                        {
+                            let labels = vec![status.name.clone(), session.user.clone()];
+                            let mut set = LABEL_COMBINATIONS.lock().unwrap();
+                            set.insert(labels);
+                        }
+
+                        // Erstelle den Schlüssel mit hub, user und source (source entspricht dem Label "source_ip")
+                        let key = vec![
+                            status.name.clone(),
+                            session.user.clone(),
+                            session.source.clone(), // <-- Hier wird session.source vorausgesetzt
+                        ];
+                        current_session_keys.insert(key.clone());
+
+
+                        let now = Instant::now();
+                        {
+                            let mut timestamps = USER_SESSION_TIMESTAMPS.lock().unwrap();
+                            // Falls diese Kombination noch nicht existiert, speichern wir jetzt den Zeitpunkt
+                            timestamps.entry(key.clone()).or_insert(now);
+                            // Berechne die verstrichene Zeit in Sekunden seit dem ersten Auftreten
+                            let first_seen = timestamps.get(&key).unwrap();
+                            let duration_seconds = now.duration_since(*first_seen).as_secs() as f64;
+                            USER_DURATION_SECONDS
+                                .with_label_values(&[&status.name, &session.user, &session.source])
+                                .set(duration_seconds);
+                        }
+
                         if let Some(val) = transfer_bytes.get(&session.user) {
                             let val = val + session.transfer_bytes;
                             transfer_bytes.insert(session.user.clone(), val);
+                           
+
                         } else {
                             let val = session.transfer_bytes;
                             transfer_bytes.insert(session.user.clone(), val);
@@ -271,7 +334,44 @@ impl Exporter {
                             .with_label_values(&[&status.name, user])
                             .set(*packets);
                     }
+
+
+
+                    // Entferne veraltete Einträge:
+                    {
+                        let mut timestamps = USER_SESSION_TIMESTAMPS.lock().unwrap();
+                        // Sammle alle Keys, die nicht mehr in der aktuellen Rückgabe vorhanden sind.
+                        let keys_to_remove: Vec<Vec<String>> = timestamps
+                            .keys()
+                            .cloned()
+                            .filter(|key| !current_session_keys.contains(key))
+                            .collect();
+
+                        for key in keys_to_remove {
+                            match USER_DURATION_SECONDS.remove_label_values(&[&key[0], &key[1], &key[2]]) {
+                                Ok(()) => {
+                                    println!(
+                                        "Removed USER_DURATION_SECONDS gauge for hub: {}, user: {}, source: {}",
+                                        key[0], key[1], key[2]
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!("Removed USER_DURATION_SECONDS  error for hub: {}, user: {}, source: {}:  {:?}",  key[0], key[1], key[2], e);
+                                }
+                            }
+                            // Entferne den Eintrag aus der globalen Zeitstempel-Map
+                            timestamps.remove(&key);
+                        }
+                    }
+
+
+
+
                 }
+
+              
+
+              
 
                 let git_revision = GIT_REVISION.unwrap_or("");
                 let rust_version = RUST_VERSION.unwrap_or("");
